@@ -1,0 +1,218 @@
+import { unobservableMembers } from "@mega-yfue/eufy-sdk";
+import { onBatteryPower } from "./power.mjs";
+import { cameraViews, cameraView } from "./camera-views.mjs";
+// The host-facing view of a device: identity + capabilities + live property values + a stream path for
+// cameras. This is the shape the WS `devices.list` / `device.state` / `device.properties` commands and
+// the go2rtc camera registration both read, so a camera is "a device describeDevice gave a `stream`",
+// not `deviceClass === "camera"` (the SDK downgrades a camera behind a HomeBase to "other").
+
+export function createDeviceView(ctx) {
+  const { eufy } = ctx;
+  // Which members of a bound capability are settable but never reported; injectable so a test can state it.
+  const unobservable = ctx.unobservableMembers ?? unobservableMembers;
+  const { streaming } = ctx.state;
+
+  /**
+   * Build the host-facing summary of one device: identity + capabilities + a stream path for a camera.
+   *
+   * `name` is the owner's device name (falling back to the product name when unnamed), `model` is the
+   * T-code, `modelName` is the product. A host shows `name` as the device name and `model`/`modelName`
+   * as its model — no cross-referencing the device list.
+   */
+  async function describeDevice(sn) {
+    const dev = await eufy.getDevice(sn);
+    const m = dev.describe();
+    const isCamera = m.capabilities.includes("camera") || m.capabilities.includes("video");
+    const station = stationOf(dev, m.sn); // {} | { stationSn }
+    return {
+      sn: m.sn,
+      name: m.name, // owner's device name (e.g. "Dining room"), from device_name
+      model: m.model || m.modelName, // T-code (e.g. "T8410"); product name as fallback
+      modelName: m.modelName, // product display name (e.g. "Indoor Cam Pan & Tilt")
+      codec: m.codec,
+      capabilities: m.capabilities,
+      state: propertyState(dev), // live property values ({ battery: 74, motion: false, … })
+      ...decodedReadings(dev, m),
+      ...liveness(m.sn, station.stationSn), // availability facts a host turns into an online/offline verdict
+      ...station, // the station it hangs off: its own serial when standalone
+      stream: isCamera ? `/stream/${m.sn}` : undefined,
+      views: isCamera ? cameraViews(dev.camera?.()).map((view) => cameraView(m.sn, view)) : undefined,
+      streaming: isCamera ? streaming.has(m.sn) : undefined, // live P2P feed active right now?
+      // "battery" | "wired", decided the way the SDK decides it (power.mjs): the `battery` capability alone
+      // also marks mains-only models.
+      power: isCamera ? (onBatteryPower(m.model, m.capabilities) ? "battery" : "wired") : undefined,
+      canReboot: m.codec === "station", // HomeBase-only; drives a Reboot button in HA
+    };
+  }
+
+  /**
+   * The station a device hangs off, as `{ stationSn }`: a HomeBase's serial for a camera or sensor attached
+   * to it, the device's own serial for a standalone device or a station. Read from the SDK's device model,
+   * else from its `deviceState`; omitted when neither names one. A host needs it to tell a HomeBase-attached
+   * device, whose transport is its station's and whose `lastSeenMs` moves only when it reports an event,
+   * from a standalone one.
+   */
+  function stationOf(dev, sn) {
+    const stationSn = dev.stationSn ?? eufy.deviceState?.(sn)?.stationSn;
+    return typeof stationSn === "string" && stationSn ? { stationSn } : {};
+  }
+
+  /** Live property values as a flat `{ name: value }` map (reading schedules a background refresh). */
+  function propertyState(dev) {
+    const out = {};
+    for (const [name, pv] of Object.entries(dev.getProperties())) out[name] = pv.value;
+    return out;
+  }
+
+  /**
+   * The SDK's honest liveness FACTS for a device — never an online/offline verdict, which is a
+   * per-device threshold the host owns (see the SDK's `DeviceState` doc). `availability` is the explicit
+   * vendor observation when one has been seen (authoritative); `lastSeenMs` is when the device last
+   * reported to the cloud. Both are omitted when the SDK has nothing — an older SDK, or a device that
+   * has never emitted the signal — so a host that relies on `state.deviceStatus` is unaffected.
+   */
+  function liveness(sn, stationSn) {
+    const out = {};
+    const lastSeenMs = eufy.deviceState?.(sn)?.lastSeenMs;
+    if (typeof lastSeenMs === "number") out.lastSeenMs = lastSeenMs;
+    const availability = eufy.deviceAvailability?.(sn)?.availability;
+    if (availability === "available" || availability === "unavailable") out.availability = availability;
+    // A connected P2P session proves a live transport right now — even while the device only sends
+    // keepalives/events and no param frames (so `lastSeenMs` stays put). STANDALONE: the session is keyed
+    // by the device's OWN serial. HOMEBASE-ATTACHED: the session is keyed by the STATION, and a connected
+    // station IS the child's transport — the bridge streams and commands the child through it — so count
+    // the station's live session as the child's reachability. Without this, an attached camera that only
+    // ever reports events (never param frames) looks stale and falsely reads offline while its HomeBase is
+    // up. If the station's session drops, `p2pReachable` is omitted and staleness decides, as before.
+    const sessions = eufy.getP2pSessions?.();
+    const reachable =
+      sessions?.get(sn)?.isConnected === true ||
+      (typeof stationSn === "string" && stationSn !== sn && sessions?.get(stationSn)?.isConnected === true);
+    if (reachable) out.p2pReachable = true;
+    return out;
+  }
+
+  /**
+   * The manifest's capabilities that have a read surface. A capability whose whole surface is inbound events
+   * (`person_detection`, since eufy-sdk 0.4.0) carries no `accessor` and no reads, so it has nothing to decode
+   * and is left out of both `decodedState` and `decodedProperties`.
+   */
+  function readSurfaces(manifest) {
+    return (manifest.details ?? []).filter((cap) => typeof cap.accessor === "string" && cap.accessor);
+  }
+
+  /** Read only the getters named by the SDK manifest; never invoke an action or setter. */
+  function decodedReadings(dev, manifest = dev.describe()) {
+    const errors = [];
+    const decodedState = Object.fromEntries(
+      readSurfaces(manifest).map((cap) => {
+        const surface = dev[cap.accessor]?.();
+        return [
+          cap.accessor,
+          Object.fromEntries(
+            (cap.reads ?? []).map((read) => {
+              let value;
+              try {
+                value = surface?.[read.accessor];
+                if (
+                  value != null &&
+                  typeof value !== "string" &&
+                  typeof value !== "boolean" &&
+                  !(typeof value === "number" && Number.isFinite(value))
+                ) {
+                  errors.push({ capability: cap.accessor, accessor: read.accessor, error: "non_scalar" });
+                  value = undefined;
+                }
+              } catch {
+                // Keep raw state available if an optional decoder fails. Never expose exception data.
+                errors.push({ capability: cap.accessor, accessor: read.accessor, error: "read_failed" });
+              }
+              return [read.accessor, value ?? null];
+            }),
+          ),
+        ];
+      }),
+    );
+    return { decodedState, ...(errors.length ? { decodedErrors: errors } : {}) };
+  }
+
+  /** Keep the SDK's read metadata and capability namespaces, without re-deriving a second schema. */
+  function decodedProperties(dev, manifest = dev.describe()) {
+    return {
+      bound: manifest.bound,
+      details: readSurfaces(manifest).map(({ capability, accessor, reads }) => ({
+        capability,
+        accessor,
+        reads,
+      })),
+    };
+  }
+
+  /**
+   * The device's property manifest — the host-relevant half of each PropertySpec, so a frontend can
+   * build the right entity (writable bool → switch, enum → select, number → number, else sensor)
+   * without knowing eufy wire ids. Wire-only fields (paramType, decode, aliases) are omitted.
+   */
+  function propertySpecs(dev) {
+    const reported = (dev.properties ?? []).map((p) => ({
+      name: p.name,
+      type: p.type, // "bool" | "number" | "string" | "enum"
+      unit: p.unit, // "%", "°C", "dBm", …
+      kind: p.kind, // percent | celsius | dbm | seconds | …
+      writable: p.writable, // a setter exists (device.set accepts it)
+      // whether the device has reported it (eufy-sdk 0.5+); false lets a host keep a never-reported
+      // read-only value out of view. Undefined on an older SDK, which a host treats as "unknown".
+      reported: p.reported,
+      enumValues: p.enumValues, // { raw: label } for enums
+      description: p.description,
+    }));
+    // Write-only settings a device ACCEPTS but never reports back (a HomeBase's alarm volume). They are
+    // not in `dev.properties` — that manifest is what the device reports — so a host would otherwise never
+    // learn the control exists. The SDK states them in two halves: `unobservableMembers(dev.<cap>())` names
+    // the members that are settable but never reported, and `dev.describe()` carries each one's setter as
+    // an action whose first argument gives the kind and bounds. Joined here into one spec, marked
+    // `writeOnly` so a frontend shows an optimistic control (the device won't confirm the value) and drives
+    // it through the same `device.set` path.
+    // A device can declare a write-only setting whose name a reported property already carries (a
+    // doorbell reports `ringtoneVolume` AND accepts a write-only one). The reported spec wins — it has a
+    // live value — so a write-only is added only when the name is new, or a host builds two entities
+    // with the same unique id. The setter is found by naming convention (`alarmVolume` → `setAlarmVolume`):
+    // a member whose setter is named otherwise is skipped, not guessed, so a mismatch silently omits it.
+    const reportedNames = new Set(reported.map((p) => p.name));
+    const writeOnly = [];
+    for (const cap of dev.describe?.().details ?? []) {
+      const surface = typeof dev[cap.accessor] === "function" ? dev[cap.accessor]() : undefined;
+      if (!surface) continue;
+      for (const name of unobservable(surface)) {
+        if (reportedNames.has(name) || writeOnly.some((w) => w.name === name)) continue;
+        const setter = cap.actions.find((a) => a.name === `set${name[0].toUpperCase()}${name.slice(1)}`);
+        const arg = setter?.args?.[0];
+        if (!arg) continue; // settable in name only: no described argument, nothing a host can build
+        writeOnly.push({
+          name,
+          type: arg.values ? "enum" : arg.kind === "bool" ? "bool" : arg.kind === "text" ? "string" : "number",
+          unit: arg.kind === "percent" ? "%" : undefined,
+          kind: arg.kind,
+          writable: true,
+          writeOnly: true,
+          min: arg.min,
+          max: arg.max,
+          enumValues: arg.values
+            ? Object.fromEntries(arg.values.map((v) => [v, arg.labels?.[v] ?? String(v)]))
+            : undefined,
+          description: setter.description,
+        });
+      }
+    }
+    return [...reported, ...writeOnly];
+  }
+
+  async function deviceList() {
+    const devices = await eufy.getDevices();
+    return Promise.all(
+      devices.map((d) => describeDevice(d.sn).catch((e) => ({ sn: d.sn, error: String(e?.message ?? e) }))),
+    );
+  }
+
+  return { describeDevice, propertyState, propertySpecs, decodedProperties, deviceList };
+}

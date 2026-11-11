@@ -1,0 +1,63 @@
+name: Eufy Doorbell Audio Trial
+version: 0.8.2-audio.1
+slug: eufy_sdk_audio_trial
+description: Reviewed live-audio candidate on the official 0.8.2 runtime. Run one
+  bridge per account.
+url: https://github.com/benneh/ha-eufy-sdk-bridge/tree/trial/homeassistant-audio
+arch:
+  - aarch64
+init: false
+hassio_api: false
+ingress: true
+ingress_port: 3000
+panel_icon: mdi:cctv
+ports:
+  3000/tcp: 3001
+  8554/tcp: 8556
+ports_description:
+  3000/tcp: Bridge WS + HTTP control (point the eufy-sdk integration here)
+  8554/tcp: RTSP
+options:
+  email: ""
+  password: ""
+  country: GB
+  poll_ms: 600000
+  stream_idle_ms: 300000
+  rtsp_idle_off_ms: 300000
+  prewarm: false
+  event_log: true
+  debug: false
+  debug_p2p: false
+  go2rtc_enable: true
+  solix_email: ""
+  solix_password: ""
+  solix_country: ""
+  solix_scene_poll_ms: 90000
+  solix_retry_base_ms: 900000
+  solix_retry_max_ms: 3600000
+schema:
+  email: str
+  password: password
+  country: str
+  poll_ms: int(0,)
+  stream_idle_ms: int(0,)
+  rtsp_idle_off_ms: int(0,)
+  stream_battery_budget_ms: int(1,)?
+  stream_fail_backoff_ms: int(0,)?
+  snapshot_live: list(auto|on|off)?
+  clip_settle_ms: int(0,)?
+  prewarm: bool
+  event_log: bool
+  debug: bool
+  debug_p2p: bool
+  go2rtc_enable: bool
+  solix_email: str?
+  solix_password: password?
+  solix_country: str?
+  solix_scene_poll_ms: int(5000,)?
+  solix_retry_base_ms: int(10000,)?
+  solix_retry_max_ms: int(10000,)?
+stage: experimental
+boot: manual
+map:
+  - share:ro
